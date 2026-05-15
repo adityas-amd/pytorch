@@ -35,16 +35,30 @@ namespace symmetric_memory {
 static StoreExchange storeExchange = StoreExchange("NCCLAllocation");
 
 struct NCCLAllocation {
+  // Combined ncclMemAlloc region. Layout:
+  //   [0, buffer_size)                                       - user buffer
+  //   [aligned_buffer_size, aligned_buffer_size + get_signal_pad_size()) - signal pad
+  // aligned_buffer_size is buffer_size rounded up to 16 bytes so the signal
+  // pad start is 16-byte aligned. Total allocation size is
+  // aligned_buffer_size + get_signal_pad_size().
   void* ptr;
   size_t buffer_size;
+  size_t aligned_buffer_size;
   int device_idx;
   std::mutex mutex;
   // Map of group name to peer alloc info
   ska::flat_hash_map<std::string, c10::intrusive_ptr<NCCLPeerAllocInfo>>
       peer_alloc_infos_;
 
-  NCCLAllocation(void* ptr, size_t buffer_size, int device_idx)
-      : ptr(ptr), buffer_size(buffer_size), device_idx(device_idx) {}
+  NCCLAllocation(
+      void* ptr,
+      size_t buffer_size,
+      size_t aligned_buffer_size,
+      int device_idx)
+      : ptr(ptr),
+        buffer_size(buffer_size),
+        aligned_buffer_size(aligned_buffer_size),
+        device_idx(device_idx) {}
 
   ~NCCLAllocation() {
     // Avoid calling CUDA functions after driver shutting down
@@ -52,6 +66,7 @@ struct NCCLAllocation {
       return;
     }
     c10::cuda::CUDAGuard guard(device_idx);
+    // Single free for the combined buffer + signal pad region.
     ncclResult_t res = ncclMemFree(ptr);
     if (res != ncclSuccess) {
         LOG(WARNING) << "ncclMemFree failed in NCCLAllocation dtor: "
@@ -166,9 +181,12 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
           " on rank ",
           rank_));
 
+    // Signal pad lives in the same ncclMemAlloc region as the buffer,
+    // starting at aligned_buffer_size (buffer_size rounded up to 16 bytes for
+    // alignment); no additional ncclMemAlloc is needed.
+    signal_pad_ptr_ = static_cast<char*>(allocation->ptr) +
+        allocation->aligned_buffer_size;
     const size_t signal_pad_size = get_signal_pad_size();
-    C10D_NCCL_CHECK(
-        ncclMemAlloc(&signal_pad_ptr_, signal_pad_size), "ncclMemAlloc failed");
     C10D_NCCL_CHECK(
     ncclCommWindowRegister(comm_, signal_pad_ptr_, signal_pad_size, &signal_handle_, NCCL_WIN_COLL_SYMMETRIC),
     c10::str(
@@ -186,11 +204,14 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
     manager.register_comm(group_name_, comm_);
 
     // Starting from NCCL 2.28, we can get peer pointers.
+    // Allocate a single device buffer for both peer arrays and split it:
+    //   [0, arr_size)            - buffers_dev_
+    //   [arr_size, 2 * arr_size) - signal_pads_dev_
     const size_t arr_size = sizeof(void*) * world_size_;
     buffers_dev_ = reinterpret_cast<void**>(
-        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
+        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size * 2));
     signal_pads_dev_ = reinterpret_cast<void**>(
-        c10::cuda::CUDACachingAllocator::raw_alloc(arr_size));
+        reinterpret_cast<char*>(buffers_dev_) + arr_size);
     buffers_.resize(world_size_);
     signal_pads_.resize(world_size_);
 
@@ -276,18 +297,12 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
                      << ncclGetErrorString(res);
       }
     }
-    if (signal_pad_ptr_ != nullptr) {
-      auto res = ncclMemFree(signal_pad_ptr_);
-      if (res != ncclSuccess) {
-        LOG(WARNING) << "ncclMemFree failed for signal_pad: "
-                     << ncclGetErrorString(res);
-      }
-    }
+    // signal_pad_ptr_ is part of the owning NCCLAllocation's combined
+    // ncclMemAlloc region; freeing the buffer there releases it too.
+    // buffers_dev_ owns the combined allocation that also backs
+    // signal_pads_dev_; a single raw_delete frees both halves.
     if (buffers_dev_ != nullptr) {
       c10::cuda::CUDACachingAllocator::raw_delete(buffers_dev_);
-    }
-    if (signal_pads_dev_ != nullptr) {
-      c10::cuda::CUDACachingAllocator::raw_delete(signal_pads_dev_);
     }
   }
 
@@ -298,6 +313,9 @@ class NCCLPeerAllocInfo : public c10::intrusive_ptr_target {
   int world_size_;
   std::vector<void*> buffers_;
   std::vector<void*> signal_pads_;
+  // buffers_dev_ owns a single CUDACachingAllocator allocation of
+  // 2 * arr_size bytes. The first half holds the peer buffer pointers;
+  // signal_pads_dev_ points at the second half (offset arr_size).
   void** buffers_dev_{nullptr};
   void** signal_pads_dev_{nullptr};
   std::string group_name_;
@@ -450,13 +468,35 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         "must not be called with a group_name");
 
     c10::cuda::CUDAGuard guard(device_idx);
-    // TODO: we might need to use a roundup or mempool for mem allocation.
+    // Allocate buffer + signal pad together in a single ncclMemAlloc call.
+    // Buffer occupies [0, size); signal pad starts at aligned_buffer_size.
+    // The signal pad start must be aligned to NCCL's window registration
+    // granularity (the CUDA VMM allocation granularity, typically 2MB on
+    // Hopper) — `ncclCommWindowRegister` rejects sub-allocation addresses
+    // that aren't aligned to that granularity.
+    size_t window_alignment = 16UL;
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+    {
+      CUmemAllocationProp prop = {};
+      prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+      prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      // NOLINTNEXTLINE(bugprone-signed-char-misuse)
+      prop.location.id = device_idx;
+      auto driver_api = c10::cuda::DriverAPI::get();
+      C10_CUDA_DRIVER_CHECK(driver_api->cuMemGetAllocationGranularity_(
+          &window_alignment, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    }
+#endif
+    const size_t aligned_buffer_size = at::round_up(size, window_alignment);
+    const size_t total_size = aligned_buffer_size + get_signal_pad_size();
     void* ptr;
-    C10D_NCCL_CHECK(ncclMemAlloc(&ptr, size), "ncclMemAlloc");
+    C10D_NCCL_CHECK(ncclMemAlloc(&ptr, total_size), "ncclMemAlloc");
     {
       std::lock_guard<std::mutex> lock(mutex_);
       allocations_.emplace(
-          ptr, std::make_unique<NCCLAllocation>(ptr, size, device_idx));
+          ptr,
+          std::make_unique<NCCLAllocation>(
+              ptr, size, aligned_buffer_size, device_idx));
     }
     return ptr;
   }
